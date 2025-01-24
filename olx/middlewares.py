@@ -3,10 +3,16 @@
 # See documentation in:
 # https://docs.scrapy.org/en/latest/topics/spider-middleware.html
 
-from scrapy import signals
-
 # useful for handling different item types with a single interface
-from itemadapter import is_item, ItemAdapter
+
+
+import asyncio
+import random
+import ssl
+
+import aiohttp
+from scrapy import signals
+from scrapy.exceptions import NotConfigured
 
 
 class OlxSpiderMiddleware:
@@ -101,3 +107,95 @@ class OlxDownloaderMiddleware:
 
     def spider_opened(self, spider):
         spider.logger.info("Spider opened: %s" % spider.name)
+
+
+class FastRotateProxyMiddleware:
+    def __init__(
+        self, proxy_url, test_url, max_concurrent_checks, check_timeout
+    ):
+        self.proxy_url = proxy_url
+        self.test_url = test_url
+        self.max_concurrent_checks = max_concurrent_checks
+        self.check_timeout = check_timeout
+        self.proxies = []
+        self.working_proxies = set()
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        proxy_url = crawler.settings.get("PROXY_URL")
+        test_url = crawler.settings.get(
+            "PROXY_TEST_URL", "http://httpbin.org/ip"
+        )
+        max_concurrent_checks = crawler.settings.get(
+            "PROXY_MAX_CONCURRENT_CHECKS", 100
+        )
+        check_timeout = crawler.settings.get("PROXY_CHECK_TIMEOUT", 2)
+
+        if not proxy_url:
+            raise NotConfigured
+
+        middleware = cls(
+            proxy_url, test_url, max_concurrent_checks, check_timeout
+        )
+        crawler.signals.connect(
+            middleware.spider_opened, signal=signals.spider_opened
+        )
+        return middleware
+
+    async def fetch_proxies(self):
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=ssl_context)
+        ) as session:
+            async with session.get(self.proxy_url) as response:
+                if response.status == 200:
+                    text = await response.text()
+                    self.proxies = [
+                        line.strip()
+                        for line in text.split('\n')
+                        if line.strip()
+                    ]
+
+    async def check_proxy(self, proxy):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    self.test_url, proxy=f"http://{proxy}",
+                    timeout=self.check_timeout
+                ) as response:
+                    if response.status == 200:
+                        self.working_proxies.add(proxy)
+        except:
+            pass
+
+    async def check_all_proxies(self):
+        tasks = []
+        sem = asyncio.Semaphore(self.max_concurrent_checks)
+
+        async def bounded_check(proxy):
+            async with sem:
+                await self.check_proxy(proxy)
+
+        for proxy in self.proxies:
+            task = asyncio.ensure_future(bounded_check(proxy))
+            tasks.append(task)
+
+        await asyncio.gather(*tasks)
+
+    async def initialize_proxies(self):
+        await self.fetch_proxies()
+        await self.check_all_proxies()
+        print(
+            f"Found {len(self.working_proxies)} proxies from {len(self.proxies)}"
+        )
+
+    def spider_opened(self, spider):
+        asyncio.get_event_loop().run_until_complete(self.initialize_proxies())
+
+    def process_request(self, request, spider):
+        if self.working_proxies:
+            proxy = random.choice(list(self.working_proxies))
+            request.meta["proxy"] = f"http://{proxy}"

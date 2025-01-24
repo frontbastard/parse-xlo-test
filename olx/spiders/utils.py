@@ -1,5 +1,8 @@
+import locale
 import re
 from datetime import datetime
+
+locale.setlocale(locale.LC_TIME, 'uk_UA.UTF-8')
 
 
 def parse_date(raw_date):
@@ -10,9 +13,6 @@ def parse_date(raw_date):
     date_match = re.search(
         r"(\d{1,2}\s\w+\s\d{4})", raw_date
     )
-    time_match = re.search(
-        r"(\d{1,2}:\d{2})", raw_date
-    )
 
     if date_match:
         date_str = date_match.group(1)
@@ -22,22 +22,15 @@ def parse_date(raw_date):
     else:
         parsed_date = today
 
-    if time_match:
-        time_str = time_match.group(1)
-        parsed_time = datetime.strptime(time_str, "%H:%M").time()
-        parsed_date = parsed_date.replace(
-            hour=parsed_time.hour, minute=parsed_time.minute, second=0,
-            microsecond=0
-        )
-
-    return parsed_date
+    return parsed_date.date()
 
 
-def extract_main_price(text: str) -> [int, ValueError]:
+def get_price_details(text: str) -> [int, None]:
     if text:
         match = re.search(r"(\d[\d\s]*)", text)
         if match:
-            return int(match.group(1).replace(" ", ""))
-        else:
-            raise ValueError("No number found in the input text.")
+            return {
+                "value": int(match.group(1).replace(" ", "")),
+                "currency": "USD" if "$" in text else "UAH"
+            }
     return None

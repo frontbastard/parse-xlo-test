@@ -1,15 +1,6 @@
-import re
-from datetime import datetime
-
 import scrapy
-from scrapy import Selector
-from scrapy.http import Response
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.wait import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-
-from olx.spiders.utils import parse_date, extract_main_price
+from scrapy.http import FormRequest
+from olx.spiders.utils import parse_date, get_price_details
 
 
 class ProductsSpider(scrapy.Spider):
@@ -19,84 +10,69 @@ class ProductsSpider(scrapy.Spider):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.pages_crawled = 1
-        self.driver = webdriver.Chrome()
+        self.pages_crawled = 0
+        self.max_pages = 5
 
-    def close(self, reason: str):
-        self.driver.close()
-        return self.close(reason)
+    def parse(self, response):
+        self.pages_crawled += 1
+        self.logger.info(f"Parsing page {self.pages_crawled}")
 
-    def parse(self, response: Response, **kwargs):
-        acc = 0
         for product in response.css('div[data-cy="l-card"]'):
-            if acc < 3:
-                yield self._parse_detail_info(response, product)
-                # yield {
-                #     "title": product.css(
-                #         '[data-cy="ad-card-title"] h4::text'
-                #     ).get(),
-                # }
-                acc += 1
+            url = product.css('[data-cy="ad-card-title"] a::attr(href)').get()
+            if url:
+                yield response.follow(url, self.parse_product)
             else:
-                break
-        # next_page = response.css(
-        #     'a[data-cy="pagination-forward"]::attr(href)'
-        # ).get()
-        # if next_page and self.pages_crawled < 5:
-        #     self.pages_crawled += 1
-        #     yield response.follow(next_page, self.parse)
+                self.logger.warning("Found product without URL")
 
-    def _parse_detail_info(
-        self,
-        response: Response,
-        product: Selector
-    ) -> dict[str, str]:
-        absolute_url = response.urljoin(
-            product.css('[data-cy="ad-card-title"] a::attr(href)').get()
-        )
-        self.driver.get(absolute_url)
-
-        # phone
-        try:
-            phone_btn = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, 'button[data-cy="ad-contact-phone"]')
-                )
-            )
-            phone_btn_cursor = phone_btn.value_of_css_property("cursor")
-
-            if phone_btn_cursor == "pointer":
-                phone_btn.click()
-
-                phone_number_element = WebDriverWait(self.driver, 10).until(
-                    EC.presence_of_element_located(
-                        (By.CSS_SELECTOR, 'a[data-testid="contact-phone"]')
-                    )
-                )
-                phone_number = phone_number_element.text
+        if self.pages_crawled < self.max_pages:
+            next_page = response.css(
+                'a[data-cy="pagination-forward"]::attr(href)'
+            ).get()
+            if next_page:
+                self.logger.info(f"Moving to page {self.pages_crawled + 1}")
+                yield response.follow(next_page, self.parse)
             else:
-                phone_number = None
-        except Exception:
-            phone_number = None
+                self.logger.info("No more pages available")
 
-        # price
-        try:
-            price_element = self.driver.find_element(
-                By.CSS_SELECTOR, '[data-testid="ad-price-container"] h3'
-            )
-            price = price_element.text
-        except Exception:
-            price = None
-
-        return {
-            "title": product.css('[data-cy="ad-card-title"] h4::text').get(),
-            "price": {
-                "value": extract_main_price(price),
-                "currency": "USD" if "$" in price else "UAH",
-            },
-            "phone_number": phone_number,
-            "posted_at": product.css('[data-cy="ad-posted-at"]::text').get(),
-            # "posted_at": parse_date(
-            #     product.css('[data-cy="ad-posted-at"]::text').get()
-            # ),
+    def parse_product(self, response):
+        yield {
+            "title": response.css('[data-cy="ad_title"] h4::text').get(),
+            "price": get_price_details(
+                response.css(
+                    '[data-testid="ad-price-container"] h3::text'
+                ).get()
+            ),
+            "phone_number": self.get_phone_number(response),
+            "posted_at": parse_date(
+                response.css('[data-cy="ad-posted-at"]::text').get()
+            ),
+            "image": response.css(
+                '.swiper-zoom-container img::attr(src)'
+            ).get(),
+            "description": response.css(
+                '[data-cy="ad_description"] h3 + div::text'
+            ).get(),
+            "parameters": response.css(
+                '.css-41yf00 > ul p::text, .css-41yf00 > ul p span::text, .css-41yf00 > ul li::text'
+            ).getall(),
+            "views_qty": response.css(
+                '[data-testid="page-view-counter"]::text'
+            ).re_first(r'\d+'),
+            "product_id": response.xpath(
+                '//div[@data-testid="ad-footer-bar-section"]//span[contains(text(), "ID:")]//text()'
+            ).re_first(r'ID:\s*(\d+)'),
         }
+
+    def get_phone_number(self, response):
+        return FormRequest.from_response(
+            response,
+            formdata={
+                'id': response.css(
+                    'button[data-cy="ad-contact-phone"]::attr(data-id)'
+                ).get()
+            },
+            callback=self.parse_phone_number
+        )
+
+    def parse_phone_number(self, response):
+        return response.json()['value']
